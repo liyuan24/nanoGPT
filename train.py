@@ -109,6 +109,7 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+# mixed precision
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
@@ -193,15 +194,23 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
+# mixed precision: https://pytorch.org/docs/stable/amp.html#gradient-scaling
+# the forward pass can use lower precision but the backward pass should use the higher precision
+# to avoid the underflow problem(gradient is zero)
+# bfloat16 is ususally not needed gradscaler because it has enough dynamic range
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
+    iter_num += 1
+    local_iter_num += 1
+
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
 # compile the model
+# to make the model run faster
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
@@ -296,21 +305,30 @@ while True:
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        # auto mixed precision
         with ctx:
             logits, loss = model(X, Y)
+            # this is to average the accumulated gradients
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = get_batch('train') # oh, this is cool
         # backward pass, with gradient scaling if training in fp16
+        # it will multiple the loss by the scale factor and the gradients will also be scaled by the same factor
+        # due to the chain rule
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
+    # will call scaler.unscale_() before calling optimizer.step() if unscaled_() is not called before
+    # it will convert the fp16 gradients to fp32 gradients and then unscale the fp32 gradients
     scaler.step(optimizer)
+    # update the scale factor, when skipping the weight update because of overflow, it will decrease the scale factor
+    # for a consecutive iterations that no overflow happens, it will increase the scale factor
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
+    # set to none to save memory
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
